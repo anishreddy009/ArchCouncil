@@ -5,5 +5,8 @@
 __pycache__/
 *.py[cod]
 
+#keys and secrets
+.env
+
 # macOS
 .DS_Store
