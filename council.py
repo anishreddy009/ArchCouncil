@@ -1,59 +1,85 @@
+#import
+
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-
-from typing import Annotated, Union, List
+from typing import Annotated, Union, List , Any
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+import asyncio
 
 load_dotenv()
 
-class LLM_Response_Structured_Output(BaseModel):
-    message: str = Field(description="The assistant's full text response to the user's message.")
+class UserInput(BaseModel):
+    message : str = Field(description="User query")
 
-messages_history = Annotated[List[Union[SystemMessage, HumanMessage, AIMessage]], "The message history of the conversation."]
+class CouncilInput(BaseModel):
+    messages : List[Union[AIMessage,HumanMessage,SystemMessage]]
+
+
+class Response(BaseModel):
+    message : str = Field(description="Output of llm ")
+
 models = {
-    'guard_rail_agent': init_chat_model(model="llama-3.3-70b-versatile", model_provider="groq", streaming=True).with_structured_output(LLM_Response_Structured_Output),
-    'llm_1': init_chat_model(model="llama-3.1-8b-instant", model_provider="groq", streaming=True).with_structured_output(LLM_Response_Structured_Output),
-    'llm_2': init_chat_model(model="llama-3.3-70b-versatile", model_provider="groq", streaming=True).with_structured_output(LLM_Response_Structured_Output),
-    'llm_3': init_chat_model(model="meta-llama/llama-4-scout-17b-16e-instruct", model_provider="groq", streaming=True).with_structured_output(LLM_Response_Structured_Output),
-    'llm_4': init_chat_model(model="openai/gpt-oss-120b", model_provider="groq", streaming=True).with_structured_output(LLM_Response_Structured_Output),
+    'llm1': {"model": "llama-3.1-8b-instant"},
+    'llm_2': {"model": "llama-3.3-70b-versatile"},
+    'llm_3': {"model": "meta-llama/llama-4-scout-17b-16e-instruct"},
+    'llm_4': {"model": "openai/gpt-oss-20b", "reasoning_effort": "low"},
 }
 
+chair_model = 'openai/gpt-oss-120b'
 
-system_message = SystemMessage(content="You are a helpful assistant that can explain things to a 5 year old. Response should be just 1 sentence.")
-message_history = [system_message]
-judge_system_message = SystemMessage(content="You are a llm responses ranker. You will be given 4 responses from different llms along with the chat history. You will rank them based on their quality, relevance, and helpfulness. You should return only the best response from the 4 responses. You should not return any of the other responses. You should not return any explanations or reasoning. You should only return the best response.")
-judge_message_history = [judge_system_message]
 
-while True:
-    input_text = input("You: ")
-    message_history.append(HumanMessage(content=input_text))
-    judge_message_history.append(HumanMessage(content=input_text))
+councilPrompt = "You are one member of a council of AI advisors answering the user's question. Give your own honest, direct, complete answer based on your own reasoning — don't hedge, don't try to guess what other advisors might say, and don't present both sides equally if you actually have a view. Be specific and back up your reasoning with concrete points, not vague generalities. If there's a genuine important caveat, mention it briefly, but still commit to a clear answer."
 
-    responses = {}
+chairmanPrompt ='''You are the Chairman of a council of AI advisors. You have been given the user's original question along with independent answers from four council members. Your job is to synthesize these into ONE final, clear answer for the user — you are not just picking your favorite response or averaging them.
 
-    for model_name, model in models.items():
-        if model_name == 'guard_rail_agent':
-            continue
-        try:
-            response = model.invoke(message_history)
-            responses[model_name] = response
-            print(f"{model_name}: {response.message}")
-        except Exception as e:
-            print(f"{model_name}: [failed to respond: {e}]")
+Read all four answers carefully. Then:
+1. Identify where the council genuinely agrees — that consensus is a strong signal and should anchor your answer.
+2. Identify the strongest distinct point each member raised that the others missed or underweighted, and fold in whatever is genuinely valuable.
+3. If members meaningfully disagree, don't paper over it — briefly note the disagreement and use your own judgment to decide which position is better reasoned, explaining why.
+4. Do not simply copy one member's answer verbatim. Produce a single, well-reasoned, original synthesis.
+5. Be direct and commit to a clear final answer. Do not hedge or say "it depends" if the council's reasoning actually points somewhere specific.
 
-    if not responses:
-        print("All models failed to respond. Skipping this turn.")
-        continue
+Format your response as: a short final answer/recommendation first, followed by a brief explanation of your reasoning (2-4 sentences), and — only if relevant — one line noting any significant disagreement among the council and why you resolved it the way you did.'''
 
-    aggregated_responses = HumanMessage(
-        content="The responses for the above question and chat are:" +
-        "\n".join([f"model_{i}_response: {response.message}" for i, response in enumerate(responses.values())])
+
+llms = {
+    name: init_chat_model(
+        model_provider="groq",
+        temperature=0.8,
+        max_tokens=400,
+        **config,
     )
+    for name, config in models.items()
+}
 
-    final_response = models['guard_rail_agent'].invoke(judge_message_history + [aggregated_responses])
-    print(f"Final Response: {final_response.message}")
+agents = {name : create_agent(model=model_name, system_prompt= councilPrompt)
+          for name,model_name in llms.items()}
 
-    final_ai_message = AIMessage(content=final_response.message)
-    message_history.append(final_ai_message)
-    judge_message_history.append(final_ai_message)
+chair_llm = init_chat_model(model=chair_model, model_provider = 'groq',temperature = 1.2)
+
+chair_agent = create_agent(model=chair_llm,system_prompt= chairmanPrompt)
+# print(agents)
+
+async def invoking_agent(agent, user_input):
+    return await agent.ainvoke(
+        {
+            "messages": [
+                HumanMessage(content=user_input)
+            ]
+        }
+    )
+    
+async def collect_responses(user_input:str,agents) -> dict[str:Any]:
+
+    tasks = [invoking_agent(agent,user_input) for agent in agents.values()]
+    responses = await asyncio.gather(*tasks)
+    
+    return {model : response["messages"][-1].content for model,response in zip(agents.keys(),responses)}
+
+temp = asyncio.run(collect_responses(input("provide your question: "),agents))
+
+for llm,ai in temp.items():
+    print(llm,ai)
+    print()
